@@ -1,0 +1,11 @@
+true/pred,abstract_painting,cityscape,genre_painting,illustration,landscape,nude_painting,portrait,religious_painting,sketch_and_study,still_life
+abstract_painting,1332,11,23,9,59,5,19,18,13,24
+cityscape,12,1017,80,11,249,0,6,4,12,9
+genre_painting,29,84,2079,55,239,71,408,205,88,44
+illustration,18,7,79,368,22,8,10,41,25,3
+landscape,35,266,171,22,3451,5,14,16,69,21
+nude_painting,15,0,86,8,13,364,45,13,26,6
+portrait,41,9,360,25,20,45,3510,125,135,38
+religious_painting,23,17,204,60,40,21,114,1474,34,4
+sketch_and_study,15,33,129,16,82,29,138,41,730,7
+still_life,43,12,51,11,34,4,29,10,17,628

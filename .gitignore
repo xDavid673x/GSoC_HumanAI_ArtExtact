@@ -176,3 +176,6 @@ __marimo__/
 wikiart.zip
 
 .DS_Store
+ArtGAN_outputs/task1_crnn/task1_crnn/*.pt
+
+ArtGAN_outputs/task1_crnn/task1_crnn/*.pt
