@@ -1,5 +1,9 @@
 # Task 1: Convolutional-Recurrent Architectures for WikiArt
 
+## Deliverables
+
+- Trained model outputs and checkpoints: [Google Drive folder](https://drive.google.com/drive/folders/1m3cXlrUNEA3CDECekMavemhZnUDLqOFU?usp=sharing)
+
 ## Chosen Approach
 
 The most appropriate design for this task is a **multi-task convolutional-recurrent network (CRNN)** rather than three independent classifiers.
