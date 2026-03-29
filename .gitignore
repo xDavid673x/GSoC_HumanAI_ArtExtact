@@ -167,10 +167,12 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
-# Dataset
-wikiart.zip
-
 # Marimo
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Dataset
+wikiart.zip
+
+.DS_Store
