@@ -12,7 +12,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from .dataset import MISSING_LABEL, TASKS, WikiArtMultiTaskDataset
+from .dataset import TASKS, WikiArtMultiTaskDataset
 from .metrics import compute_task_metrics, mean_macro_f1
 from .model import ConvRecurrentWikiArtClassifier
 
@@ -69,6 +69,49 @@ def compute_losses(
     return total_loss, task_loss_values
 
 
+def build_grad_scaler(device: torch.device, use_amp: bool) -> Any:
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler(device.type, enabled=use_amp)
+    return torch.cuda.amp.GradScaler(enabled=use_amp)
+
+
+def autocast_context(device: torch.device, use_amp: bool) -> Any:
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast(device_type=device.type, enabled=use_amp)
+    return torch.cuda.amp.autocast(enabled=use_amp)
+
+
+def save_checkpoint(
+    output_path: str | Path,
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: CosineAnnealingLR,
+    scaler: Any,
+    num_classes: dict[str, int],
+    class_names: dict[str, list[str]],
+    args: argparse.Namespace,
+    epoch: int,
+    best_score: float,
+    best_validation: dict[str, Any],
+    history: list[dict[str, Any]],
+) -> None:
+    checkpoint = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "num_classes": num_classes,
+        "class_names": class_names,
+        "args": vars(args),
+        "best_score": best_score,
+        "best_validation": best_validation,
+        "history": history,
+    }
+    torch.save(checkpoint, output_path)
+
+
 @torch.no_grad()
 def run_validation(
     model: nn.Module,
@@ -77,6 +120,7 @@ def run_validation(
     limit_batches: int | None = None,
     show_progress: bool = False,
     epoch: int | None = None,
+    use_amp: bool = False,
 ) -> dict[str, Any]:
     model.eval()
     task_labels: dict[str, list[torch.Tensor]] = {task: [] for task in TASKS}
@@ -92,7 +136,8 @@ def run_validation(
     for batch in batch_iterator:
         total_batches += 1
         images = batch["image"].to(device)
-        outputs = model(images)
+        with autocast_context(device, use_amp):
+            outputs = model(images)
         for task in TASKS:
             mask = batch[f"mask_{task}"]
             if mask.sum().item() == 0:
@@ -144,10 +189,15 @@ def main() -> None:
     parser.add_argument("--style-loss-weight", type=float, default=1.0)
     parser.add_argument("--genre-loss-weight", type=float, default=1.0)
     parser.add_argument("--artist-loss-weight", type=float, default=1.2)
+    parser.add_argument("--pretrained-backbone", action="store_true")
+    parser.add_argument("--disable-amp", action="store_true")
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument("--resume-from", default=None)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     device = choose_device(args.device)
+    use_amp = device.type == "cuda" and not args.disable_amp
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -185,9 +235,13 @@ def main() -> None:
     )
 
     num_classes = {task: len(train_dataset.class_names[task]) for task in TASKS}
-    model = ConvRecurrentWikiArtClassifier(num_classes=num_classes).to(device)
+    model = ConvRecurrentWikiArtClassifier(
+        num_classes=num_classes,
+        pretrained_backbone=args.pretrained_backbone,
+    ).to(device)
     optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
+    scaler = build_grad_scaler(device, use_amp)
     losses = build_loss_functions(train_dataset, device, not args.disable_class_weights)
     task_weights = {
         "style": args.style_loss_weight,
@@ -197,6 +251,21 @@ def main() -> None:
 
     best_score = float("-inf")
     history: list[dict[str, Any]] = []
+    start_epoch = 1
+
+    if args.resume_from:
+        checkpoint = torch.load(args.resume_from, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        if "scaler_state_dict" in checkpoint and checkpoint["scaler_state_dict"]:
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        best_score = float(checkpoint.get("best_score", checkpoint.get("best_validation", {}).get("mean_macro_f1", float("-inf"))))
+        history = list(checkpoint.get("history", []))
+        start_epoch = int(checkpoint.get("epoch", 0)) + 1
+        print(json.dumps({"resumed_from": args.resume_from, "start_epoch": start_epoch, "best_score": best_score}, indent=2))
 
     def compact_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         compact: dict[str, Any] = {}
@@ -206,7 +275,7 @@ def main() -> None:
         compact["mean_macro_f1"] = metrics["mean_macro_f1"]
         return compact
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         running_loss = 0.0
         running_steps = 0
@@ -221,12 +290,16 @@ def main() -> None:
                 key: value.to(device) if isinstance(value, torch.Tensor) else value
                 for key, value in batch.items()
             }
-            outputs = model(images)
-            loss, task_loss_values = compute_losses(outputs, tensor_batch, losses, task_weights)
-
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+            with autocast_context(device, use_amp):
+                outputs = model(images)
+                loss, task_loss_values = compute_losses(outputs, tensor_batch, losses, task_weights)
+            scaler.scale(loss).backward()
+            if args.grad_clip_norm and args.grad_clip_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip_norm)
+            scaler.step(optimizer)
+            scaler.update()
 
             running_loss += float(loss.detach().item())
             running_steps += 1
@@ -253,6 +326,7 @@ def main() -> None:
             limit_batches=args.limit_val_batches,
             show_progress=not args.disable_progress,
             epoch=epoch,
+            use_amp=use_amp,
         )
         train_loss = running_loss / max(running_steps, 1)
         epoch_summary = {
@@ -273,17 +347,37 @@ def main() -> None:
                 indent=2,
             )
         )
+        save_checkpoint(
+            output_dir / "last.pt",
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            num_classes=num_classes,
+            class_names=train_dataset.class_names,
+            args=args,
+            epoch=epoch,
+            best_score=best_score,
+            best_validation=validation_metrics,
+            history=history,
+        )
 
         if validation_metrics["mean_macro_f1"] > best_score:
             best_score = validation_metrics["mean_macro_f1"]
-            checkpoint = {
-                "model_state_dict": model.state_dict(),
-                "num_classes": num_classes,
-                "class_names": train_dataset.class_names,
-                "args": vars(args),
-                "best_validation": validation_metrics,
-            }
-            torch.save(checkpoint, output_dir / "best.pt")
+            save_checkpoint(
+                output_dir / "best.pt",
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                num_classes=num_classes,
+                class_names=train_dataset.class_names,
+                args=args,
+                epoch=epoch,
+                best_score=best_score,
+                best_validation=validation_metrics,
+                history=history,
+            )
 
     summary = {
         "best_mean_macro_f1": best_score,

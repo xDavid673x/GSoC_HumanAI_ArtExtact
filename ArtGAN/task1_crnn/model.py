@@ -7,6 +7,11 @@ from torch import nn
 from torch.nn import functional as F
 from torchvision.models import resnet18
 
+try:
+    from torchvision.models import ResNet18_Weights
+except ImportError:  # pragma: no cover - older torchvision fallback
+    ResNet18_Weights = None
+
 
 class AttentionPool(nn.Module):
     def __init__(self, input_dim: int) -> None:
@@ -48,13 +53,17 @@ class ConvRecurrentWikiArtClassifier(nn.Module):
         recurrent_layers: int = 2,
         embedding_dim: int = 256,
         dropout: float = 0.2,
+        pretrained_backbone: bool = False,
     ) -> None:
         super().__init__()
         if not {"style", "genre", "artist"}.issubset(num_classes):
             raise ValueError("num_classes must include style, genre, and artist")
         self.grid_size = grid_size
 
-        backbone = resnet18(weights=None)
+        weights = None
+        if pretrained_backbone and ResNet18_Weights is not None:
+            weights = ResNet18_Weights.IMAGENET1K_V1
+        backbone = resnet18(weights=weights)
         self.encoder = nn.Sequential(
             backbone.conv1,
             backbone.bn1,
